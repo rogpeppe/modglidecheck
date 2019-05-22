@@ -33,15 +33,35 @@ func (gitVCS) ResolveTag(repo string, tag string) (string, error) {
 	if tag == "" {
 		panic("empty tag in " + repo)
 	}
+	// Note: technically this might be wrong because we
+	// need to know the submodule too so we know which
+	// tag to choose.
 	out, err := runCmd("git", "ls-remote", "-q", repo, tag)
 	if err != nil {
 		return "", errors.Wrap(err)
 	}
-	f := strings.Fields(out)
-	if len(f) != 2 {
-		return "", errors.Newf("unexpected ls-remote output %q from repo %q, tag %q", out, repo, tag)
+	out = strings.TrimSuffix(out, "\n")
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if len(f) != 2 {
+			return "", errors.Newf("unexpected ls-remote output %q from repo %q, tag %q", out, repo, tag)
+		}
+		if f[1] == "refs/tags/"+tag {
+			return f[0], nil
+		}
 	}
-	return f[0], nil
+	// Full match wasn't found. It might be a sub-module.
+	if len(lines) == 0 {
+		return "", errors.Newf("no tag ref for %q found in %q", tag, out)
+	}
+	if len(lines) > 1 {
+		return "", errors.Newf("ambiguous tag for %q found in %q", tag, out)
+	}
+	return strings.Fields(lines[0])[0], nil
 }
 
 type bzrVCS struct{}

@@ -3,15 +3,20 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/juju/utils/parallel"
 	"golang.org/x/tools/go/vcs"
 	"gopkg.in/errgo.v2/fmt/errors"
+	"gopkg.in/yaml.v1"
 )
 
 var (
@@ -20,7 +25,18 @@ var (
 )
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "modglide\n")
+		os.Exit(2)
+	}
 	flag.Parse()
+	if flag.NArg() != 0 {
+		flag.Usage()
+	}
+	glideMods, err := readGlideLock(filepath.Join(".", "glide.lock"))
+	if err != nil {
+		log.Fatal(err)
+	}
 	mods, err := allModules()
 	if err != nil {
 		log.Fatal(err)
@@ -55,10 +71,89 @@ func main() {
 	sort.Slice(infos, func(i, j int) bool {
 		return infos[i].project < infos[j].project
 	})
+	changed := 0
+	notChanged := 0
 	for _, info := range infos {
-		fmt.Println(info)
+		if info.vcsKind != "git" {
+			log.Fatalf("ERROR %s uses %s not git", info.project, info.vcsKind)
+			continue
+		}
+		oldVers, ok := glideMods[info.project]
+		if !ok {
+			continue
+		}
+		newVers := info.rev
+		if len(newVers) > 12 {
+			newVers = newVers[:12]
+		}
+		if len(newVers) < len(oldVers) {
+			oldVers = oldVers[0:len(newVers)]
+		}
+		if oldVers == newVers {
+			notChanged++
+			continue
+		}
+		oldDate, oldCommit, err := commitDate(info.project, oldVers)
+		if err != nil {
+			log.Printf("cannot get commit date for %v %v: %v", info.project, oldVers, err)
+		}
+		newDate, newCommit, err := commitDate(info.project, newVers)
+		if err != nil {
+			log.Printf("cannot get commit date for %v %v: %v", info.project, newVers, err)
+		}
+		if oldCommit == newCommit {
+			notChanged++
+			continue
+		}
+		var which string
+		if newDate.Before(oldDate) {
+			which = " reversion"
+		}
+		fmt.Printf("%s%s\n\t%s %v\n\t%s %v\n", info.project, which, oldVers, oldDate.Round(time.Second), newVers, newDate.Round(time.Second))
+		changed++
 	}
+	fmt.Printf("%d/%d changed\n", changed, notChanged+changed)
 	os.Exit(exitCode)
+}
+
+func commitDate(repo string, commit string) (time.Time, string, error) {
+	dir := filepath.Join(os.Getenv("GOPATH"), "src", repo)
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "XXXX go get %s\n", repo)
+			c := exec.Command("go", "get", repo)
+			c.Stderr = os.Stderr
+			c.Env = append(os.Environ(), "GO111MODULE=off")
+			if err := c.Run(); err != nil {
+				return time.Time{}, "", fmt.Errorf("could not fetch %s: %v", repo, err)
+			}
+		} else {
+			return time.Time{}, "", fmt.Errorf("no repo dir for %s", repo)
+		}
+	}
+	c := exec.Command("git", "log", "-1", "--pretty=format:%H %ct", commit)
+	c.Dir = dir
+	data, err := c.Output()
+	if err != nil {
+		c = exec.Command("git", "fetch", "origin")
+		c.Dir = dir
+		if err := c.Run(); err != nil {
+			return time.Time{}, "", fmt.Errorf("cannot fetch origin in %s: %v", repo, err)
+		}
+		c = exec.Command("git", "log", "-1", "--pretty=format:%ct", commit)
+		c.Dir = dir
+		c.Stderr = os.Stderr
+		data, err = c.Output()
+		if err != nil {
+			return time.Time{}, "", fmt.Errorf("cannot get log for %s: %v", repo, err)
+		}
+	}
+	var timestamp int64
+	var actualCommit string
+	if n, err := fmt.Sscanf(string(data), "%s %d\n", &actualCommit, &timestamp); n != 2 || err != nil {
+		return time.Time{}, "", fmt.Errorf("scan %q failed: %v", err)
+	}
+	return time.Unix(timestamp, 0).UTC(), actualCommit, nil
 }
 
 func getRev(m *listModule) (*depInfo, error) {
@@ -147,4 +242,29 @@ func errorf(f string, a ...interface{}) {
 	exitCodeMu.Lock()
 	defer exitCodeMu.Unlock()
 	exitCode = 1
+}
+
+func readGlideLock(f string) (map[string]string, error) {
+	data, err := ioutil.ReadFile(f)
+	if err != nil {
+		return nil, errors.Wrap(err)
+	}
+	var gl glideLock
+	if err := yaml.Unmarshal(data, &gl); err != nil {
+		return nil, errors.Wrap(err)
+	}
+	deps := make(map[string]string)
+	for _, imp := range gl.Imports {
+		deps[imp.Name] = imp.Version
+	}
+	return deps, nil
+}
+
+type glideLock struct {
+	Imports []glideVersion `yaml:"imports"`
+}
+
+type glideVersion struct {
+	Name    string `yaml:"name"`
+	Version string `yaml:"version"`
 }
